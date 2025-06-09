@@ -15,26 +15,34 @@ import (
     "k8s.io/client-go/tools/clientcmd"
 )
 
-const tableFmt = "%-15s %-35s %-10s %-15s %-8s %-10s\n"
+// tableFmt uses \t (tab) separators so that tabwriter can adjust each column
+// to the widest cell automatically. No fixed widths are hard‑coded.
+const tableFmt = "%s\t%s\t%s\t%s\t%s\t%s\t\n"
 
 func main() {
     remoteCtx := flag.String("remote-context", "its1", "remote hosting context (for ManagedCluster)")
-    kubeconfig := flag.String("kubeconfig", "", "path to kubeconfig")
+    kubeconfig := flag.String("kubeconfig", "", "path to kubeconfig (defaults to $HOME/.kube/config)")
     flag.Parse()
 
-    // ----- local cluster -----
-    currCtx, localClient := buildClient(*kubeconfig, "")
-    printHeader()
-    listNodes(currCtx, localClient)
+    // Create a single tabwriter instance for the whole table.
+    tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 
-    // ----- managed clusters (remote) -----
+    // ---------- local (current) cluster ----------
+    currCtx, localClient := buildClient(*kubeconfig, "")
+    printHeader(tw)
+    listNodes(tw, currCtx, localClient)
+
+    // ---------- managed (remote) clusters ----------
     if *remoteCtx != "" {
         dyn := buildDynamicClient(*kubeconfig, *remoteCtx)
-        listManagedClusters(dyn, *kubeconfig)
+        listManagedClusters(tw, dyn, *kubeconfig)
     }
+
+    // Flush once at the end so that all rows are aligned consistently.
+    tw.Flush()
 }
 
-// buildClient returns the context name and a typed clientset
+// buildClient returns the context name and a typed clientset bound to it.
 func buildClient(kcfg, ctxOverride string) (string, *kubernetes.Clientset) {
     loading := clientcmd.NewDefaultClientConfigLoadingRules()
     if kcfg != "" {
@@ -59,7 +67,7 @@ func buildClient(kcfg, ctxOverride string) (string, *kubernetes.Clientset) {
     return rawCfg.CurrentContext, cs
 }
 
-// buildDynamicClient creates a dynamic client bound to the given context
+// buildDynamicClient creates a dynamic client bound to the given context.
 func buildDynamicClient(kcfg, ctxOverride string) dynamic.Interface {
     loading := clientcmd.NewDefaultClientConfigLoadingRules()
     if kcfg != "" {
@@ -74,8 +82,8 @@ func buildDynamicClient(kcfg, ctxOverride string) dynamic.Interface {
     return dyn
 }
 
-// listNodes prints one line per node belonging to the given cluster
-func listNodes(clusterName string, cs *kubernetes.Clientset) {
+// listNodes prints one line per node belonging to the given cluster.
+func listNodes(tw *tabwriter.Writer, clusterName string, cs *kubernetes.Clientset) {
     nodes, err := cs.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
     exitIf(err)
 
@@ -94,8 +102,9 @@ func listNodes(clusterName string, cs *kubernetes.Clientset) {
 
         role := "<none>"
         for k := range n.Labels {
-            if len(k) >= 24 && k[:24] == "node-role.kubernetes.io/" {
-                role = k[24:]
+            const prefix = "node-role.kubernetes.io/"
+            if len(k) >= len(prefix) && k[:len(prefix)] == prefix {
+                role = k[len(prefix):]
                 break
             }
         }
@@ -103,12 +112,12 @@ func listNodes(clusterName string, cs *kubernetes.Clientset) {
         age := humanAge(n.CreationTimestamp.Time)
         version := n.Status.NodeInfo.KubeletVersion
 
-        printRow(clusterName, n.Name, status, role, age, version)
+        printRow(tw, clusterName, n.Name, status, role, age, version)
     }
 }
 
-// listManagedClusters discovers ManagedCluster resources and prints their nodes
-func listManagedClusters(dyn dynamic.Interface, kubeconfig string) {
+// listManagedClusters discovers ManagedCluster resources and prints their nodes.
+func listManagedClusters(tw *tabwriter.Writer, dyn dynamic.Interface, kubeconfig string) {
     gvr := schema.GroupVersionResource{Group: "cluster.open-cluster-management.io", Version: "v1", Resource: "managedclusters"}
 
     mcs, err := dyn.Resource(gvr).List(context.TODO(), metav1.ListOptions{})
@@ -121,21 +130,18 @@ func listManagedClusters(dyn dynamic.Interface, kubeconfig string) {
         name := mc.GetName()
         // create a client bound to this managed cluster context
         _, cs := buildClient(kubeconfig, name)
-        listNodes(name, cs)
+        listNodes(tw, name, cs)
     }
 }
 
-// printHeader prints the table header without vertical bars or horizontals
-func printHeader() {
-    w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-    fmt.Fprintf(w, tableFmt, "CLUSTER", "NAME", "STATUS", "ROLES", "AGE", "VERSION")
-    w.Flush()
+// printHeader outputs the table header.
+func printHeader(tw *tabwriter.Writer) {
+    fmt.Fprintf(tw, tableFmt, "CLUSTER", "NAME", "STATUS", "ROLES", "AGE", "VERSION")
 }
 
-func printRow(cluster, name, status, roles, age, version string) {
-    w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-    fmt.Fprintf(w, tableFmt, cluster, name, status, roles, age, version)
-    w.Flush()
+// printRow outputs a single data row.
+func printRow(tw *tabwriter.Writer, cluster, name, status, roles, age, version string) {
+    fmt.Fprintf(tw, tableFmt, cluster, name, status, roles, age, version)
 }
 
 func humanAge(t time.Time) string {
