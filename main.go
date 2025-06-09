@@ -1,139 +1,150 @@
 package main
 
 import (
-	"context"
-	"flag"
-	"fmt"
-	"os"
-	"strings"
-	"text/tabwriter"
-	"time"
+    "context"
+    "flag"
+    "fmt"
+    "os"
+    "text/tabwriter"
+    "time"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/clientcmd"
+    metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+    "k8s.io/apimachinery/pkg/runtime/schema"
+    "k8s.io/client-go/dynamic"
+    "k8s.io/client-go/kubernetes"
+    "k8s.io/client-go/tools/clientcmd"
 )
 
-const (
-	colFmt       = "%-6s | %-20s | %-15s | %-28s\n" // format for tabular output
-	separatorLen = 78                               // length of the table separator line
-)
+const tableFmt = "%-15s %-35s %-10s %-15s %-8s %-10s\n"
 
 func main() {
-	// Command-line flags
-	remoteCtx := flag.String("remote-context", "its1", "remote hosting context (for ManagedCluster)")
-	kubeconfig := flag.String("kubeconfig", "", "path to kubeconfig (defaults to $HOME/.kube/config)")
-	flag.Parse()
+    remoteCtx := flag.String("remote-context", "its1", "remote hosting context (for ManagedCluster)")
+    kubeconfig := flag.String("kubeconfig", "", "path to kubeconfig")
+    flag.Parse()
 
-	// ---------- Local Cluster ----------
-	currCtx, localClient := buildClient(*kubeconfig, "")
-	printHeader()
-	printRow(currCtx, currCtx, "CLUSTER", "-")
-	listLocalNodes(localClient)
+    // ----- local cluster -----
+    currCtx, localClient := buildClient(*kubeconfig, "")
+    printHeader()
+    listNodes(currCtx, localClient)
 
-	// ---------- Remote Cluster ----------
-	if *remoteCtx != "" {
-		remoteClient := buildDynamicClient(*kubeconfig, *remoteCtx)
-		listManagedClusters(remoteClient, *remoteCtx)
-	}
+    // ----- managed clusters (remote) -----
+    if *remoteCtx != "" {
+        dyn := buildDynamicClient(*kubeconfig, *remoteCtx)
+        listManagedClusters(dyn, *kubeconfig)
+    }
 }
 
-// buildClient returns the current context name and a kubernetes Clientset
-func buildClient(kcfg, overrideCtx string) (string, *kubernetes.Clientset) {
-	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
-	if kcfg != "" {
-		loadingRules.ExplicitPath = kcfg
-	}
-	cfgOverrides := &clientcmd.ConfigOverrides{}
-	if overrideCtx != "" {
-		cfgOverrides.CurrentContext = overrideCtx
-	}
-	cc := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, cfgOverrides)
-	rawCfg, err := cc.RawConfig()
-	exitIf(err)
+// buildClient returns the context name and a typed clientset
+func buildClient(kcfg, ctxOverride string) (string, *kubernetes.Clientset) {
+    loading := clientcmd.NewDefaultClientConfigLoadingRules()
+    if kcfg != "" {
+        loading.ExplicitPath = kcfg
+    }
+    overrides := &clientcmd.ConfigOverrides{}
+    if ctxOverride != "" {
+        overrides.CurrentContext = ctxOverride
+    }
 
-	ctx := rawCfg.CurrentContext
-	restCfg, err := cc.ClientConfig()
-	exitIf(err)
+    cfg := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loading, overrides)
 
-	clientset, err := kubernetes.NewForConfig(restCfg)
-	exitIf(err)
-	return ctx, clientset
+    rawCfg, err := cfg.RawConfig()
+    exitIf(err)
+
+    restCfg, err := cfg.ClientConfig()
+    exitIf(err)
+
+    cs, err := kubernetes.NewForConfig(restCfg)
+    exitIf(err)
+
+    return rawCfg.CurrentContext, cs
 }
 
-// buildDynamicClient returns a dynamic.Interface client for custom resources
-func buildDynamicClient(kcfg, overrideCtx string) dynamic.Interface {
-	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
-	if kcfg != "" {
-		loadingRules.ExplicitPath = kcfg
-	}
-	cfgOverrides := &clientcmd.ConfigOverrides{CurrentContext: overrideCtx}
-	restCfg, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, cfgOverrides).ClientConfig()
-	exitIf(err)
+// buildDynamicClient creates a dynamic client bound to the given context
+func buildDynamicClient(kcfg, ctxOverride string) dynamic.Interface {
+    loading := clientcmd.NewDefaultClientConfigLoadingRules()
+    if kcfg != "" {
+        loading.ExplicitPath = kcfg
+    }
+    overrides := &clientcmd.ConfigOverrides{CurrentContext: ctxOverride}
+    restCfg, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loading, overrides).ClientConfig()
+    exitIf(err)
 
-	dyn, err := dynamic.NewForConfig(restCfg)
-	exitIf(err)
-	return dyn
+    dyn, err := dynamic.NewForConfig(restCfg)
+    exitIf(err)
+    return dyn
 }
 
-// listLocalNodes prints nodes in the current local cluster
-func listLocalNodes(cs *kubernetes.Clientset) {
-	ctx := context.TODO()
-	nodes, err := cs.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
-	exitIf(err)
+// listNodes prints one line per node belonging to the given cluster
+func listNodes(clusterName string, cs *kubernetes.Clientset) {
+    nodes, err := cs.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
+    exitIf(err)
 
-	for _, n := range nodes.Items {
-		age := humanAge(n.CreationTimestamp.Time)
-		printRow("", "  "+n.Name, "NODE", age)
-	}
+    for _, n := range nodes.Items {
+        status := "Unknown"
+        for _, c := range n.Status.Conditions {
+            if c.Type == "Ready" {
+                if c.Status == "True" {
+                    status = "Ready"
+                } else {
+                    status = "NotReady"
+                }
+                break
+            }
+        }
+
+        role := "<none>"
+        for k := range n.Labels {
+            if len(k) >= 24 && k[:24] == "node-role.kubernetes.io/" {
+                role = k[24:]
+                break
+            }
+        }
+
+        age := humanAge(n.CreationTimestamp.Time)
+        version := n.Status.NodeInfo.KubeletVersion
+
+        printRow(clusterName, n.Name, status, role, age, version)
+    }
 }
 
-// listManagedClusters lists remote managed clusters from the specified context
-func listManagedClusters(dyn dynamic.Interface, remoteCtx string) {
-	ctx := context.TODO()
-	gvr := schema.GroupVersionResource{
-		Group:    "cluster.open-cluster-management.io",
-		Version:  "v1",
-		Resource: "managedclusters",
-	}
-	mcs, err := dyn.Resource(gvr).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: list managedclusters failed in context %s: %v\n", remoteCtx, err)
-		return
-	}
-	for _, item := range mcs.Items {
-		age := humanAge(item.GetCreationTimestamp().Time)
-		printRow(remoteCtx, item.GetName(), "REMOTE-CLUSTER", age)
-	}
+// listManagedClusters discovers ManagedCluster resources and prints their nodes
+func listManagedClusters(dyn dynamic.Interface, kubeconfig string) {
+    gvr := schema.GroupVersionResource{Group: "cluster.open-cluster-management.io", Version: "v1", Resource: "managedclusters"}
+
+    mcs, err := dyn.Resource(gvr).List(context.TODO(), metav1.ListOptions{})
+    if err != nil {
+        fmt.Fprintf(os.Stderr, "warning: could not list managedclusters: %v\n", err)
+        return
+    }
+
+    for _, mc := range mcs.Items {
+        name := mc.GetName()
+        // create a client bound to this managed cluster context
+        _, cs := buildClient(kubeconfig, name)
+        listNodes(name, cs)
+    }
 }
 
-// printHeader prints the table header
+// printHeader prints the table header without vertical bars or horizontals
 func printHeader() {
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 1, ' ', 0)
-	fmt.Fprintf(w, colFmt, "CTX", "RESOURCE", "TYPE", "AGE")
-	fmt.Fprintln(w, strings.Repeat("-", separatorLen))
-	w.Flush()
+    w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+    fmt.Fprintf(w, tableFmt, "CLUSTER", "NAME", "STATUS", "ROLES", "AGE", "VERSION")
+    w.Flush()
 }
 
-// printRow prints a formatted row
-func printRow(a, b, c, d string) {
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 1, ' ', 0)
-	fmt.Fprintf(w, colFmt, a, b, c, d)
-	w.Flush()
+func printRow(cluster, name, status, roles, age, version string) {
+    w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+    fmt.Fprintf(w, tableFmt, cluster, name, status, roles, age, version)
+    w.Flush()
 }
 
-// humanAge returns a human-readable age string from the given time
 func humanAge(t time.Time) string {
-	d := time.Since(t).Round(time.Second)
-	return d.String()
+    return time.Since(t).Round(time.Second).String()
 }
 
-// exitIf prints the error and exits if the error is non-nil
 func exitIf(err error) {
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
-	}
+    if err != nil {
+        fmt.Fprintf(os.Stderr, "error: %v\n", err)
+        os.Exit(1)
+    }
 }
